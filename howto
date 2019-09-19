@@ -1,0 +1,440 @@
+This example illustrates:
+
+ 
+
+1. Initialization of the MKL25Z128 MCU (mainly I2C and PORT modules).
+
+2. I2C data write and read operations.
+
+3. Initialization of the FXOS8700CQ.
+
+4. Simple accelerometer offset calibration based on the AN4069.
+
+5. Simple magnetic hard-iron offset calibration.
+
+6. Output data reading using an interrupt technique.
+
+7. Conversion of the output values from registers 0x01 – 0x06 and 0x33 – 0x38 to real values in g’s and µT and simple heading angle calculation.
+
+8. Visualization of the calculated values in the FreeMASTER tool.
+
+1. As you can see in the FRDM-FXS-MULTI(-B)/FRDM-KL25Z schematics and the image below, I2C signals are routed to the I2C1 module (PTC1 and PTC2 pins) of the KL25Z MCU and the INT1 output is connected to the PTD4 pin (make sure that pins 1-2 of J3 on the sensor expansion board are connected together using a jumper). The INT1 output of the FXOS8700CQ is configured as a push-pull active-low output, so the corresponding PTD4 pin configuration is GPIO with an interrupt on falling edge.
+
+
+Boards.JPG.jpg
+
+The MCU is, therefore, configured as follows.
+
+
+void MCU_Init(void)
+
+{
+
+     //I2C1 module initialization
+
+     SIM_SCGC4 |= SIM_SCGC4_I2C1_MASK;        // Turn on clock to I2C1 module
+
+     SIM_SCGC5 |= SIM_SCGC5_PORTC_MASK;       // Turn on clock to Port C module
+
+     PORTC_PCR1 |= PORT_PCR_MUX(0x2);         // PTC1 pin is I2C1 SCL line
+
+     PORTC_PCR2 |= PORT_PCR_MUX(0x2);         // PTC2 pin is I2C1 SDA line
+
+     I2C1_F  |= I2C_F_ICR(0x14);              // SDA hold time = 2.125us, SCL start hold time = 4.25us, SCL stop hold time = 5.125us
+
+     I2C1_C1 |= I2C_C1_IICEN_MASK;            // Enable I2C0 module
+
+        
+
+     //Configure the PTD4 pin (connected to the INT1 of the FXOS8700CQ) for falling edge interrupts
+
+     SIM_SCGC5 |= SIM_SCGC5_PORTD_MASK;       // Turn on clock to Port A module
+
+     PORTD_PCR4 |= (0|PORT_PCR_ISF_MASK|      // Clear the interrupt flag
+
+                     PORT_PCR_MUX(0x1)|       // PTD4 is configured as GPIO
+
+                     PORT_PCR_IRQC(0xA));     // PTD4 is configured for falling edge interrupts
+
+        
+
+         //Enable PORTD interrupt on NVIC
+
+     NVIC_ICPR |= 1 << ((INT_PORTD - 16)%32);
+
+     NVIC_ISER |= 1 << ((INT_PORTD - 16)%32);
+
+}
+
+ 
+
+2. The 7-bit I2C address of the FXOS8700CQ is 0x1E since both SA0 and SA1 lines are shorted to GND using jumpers J21 and J23 on the sensor board. As shown above, the SCL line is connected to the PTC1 pin and SDA line to the PTC2 pin. The I2C clock frequency is 125 kHz.
+
+ 
+
+The screenshot below shows the write operation which writes the value 0x35 to the CTRL_REG1 (0x2A).
+
+ 
+
+I2C Write.JPG.jpg
+
+ 
+
+And here is the single byte read from the WHO_AM_I register 0x0D. As you can see, it returns the correct value 0xC7.
+
+ 
+
+I2C Read.JPG.jpg
+
+ 
+
+Multiple bytes of data can be read from sequential registers after each FXOS8700CQ acknowledgment (AK) is received until a no acknowledge (NAK) occurs from the KL25Z followed by a stop condition (SP) signaling an end of transmission. A burst read of 6 bytes from registers 0x33 to 0x38, that is performed in the calibration routine “FXOS8700CQ_Mag_Calibration()”, is shown below. It also shows when the INT1 pin is automatically cleared.
+
+ 
+
+I2C Burst Read.JPG.jpg
+
+
+3. At the beginning of the initialization, all registers are reset to their default values by setting the RST bit of the CTRL_REG2 register. Then the FXOS8700CQ is initialized as shown below.
+
+
+void FXOS8700CQ_Init (void)
+
+{
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG2, 0x40);          // Reset all registers to POR values
+
+ 
+
+     Pause(0x631);        // ~1ms delay
+
+ 
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, XYZ_DATA_CFG_REG, 0x00);   // +/-2g range with 0.244mg/LSB  
+
+ 
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, M_CTRL_REG1, 0x1F);        // Hybrid mode (accelerometer + magnetometer), max OSR
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, M_CTRL_REG2, 0x20);        // M_OUT_X_MSB register 0x33 follows the OUT_Z_LSB register 0x06 (used for burst read)           
+
+ 
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG2, 0x02);          // High Resolution mode
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG3, 0x00);          // Push-pull, active low interrupt
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG4, 0x01);          // Enable DRDY interrupt
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG5, 0x01);          // DRDY interrupt routed to INT1 - PTD4
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG1, 0x35);          // ODR = 3.125Hz, Reduced noise, Active mode  
+
+}
+
+ 
+
+4. A simple accelerometer offset calibration method is implemented according to the AN4069.
+
+ 
+
+void FXOS8700CQ_Accel_Calibration (void)
+
+{
+
+     char X_Accel_offset, Y_Accel_offset, Z_Accel_offset;
+
+
+     DataReady = 0;      
+
+         while (!DataReady){}       // Is a first set of data ready?
+
+     DataReady = 0;
+
+ 
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG1, 0x00);          // Standby mode     
+
+ 
+
+     I2C_ReadMultiRegisters(FXOS8700CQ_I2C_ADDRESS, OUT_X_MSB_REG, 6, AccelMagData);          // Read data output registers 0x01-0x06  
+
+        
+
+     Xout_Accel_14_bit = ((short) (AccelMagData[0]<<8 | AccelMagData[1])) >> 2;        // Compute 14-bit X-axis acceleration output value
+
+     Yout_Accel_14_bit = ((short) (AccelMagData[2]<<8 | AccelMagData[3])) >> 2;        // Compute 14-bit Y-axis acceleration output value
+
+     Zout_Accel_14_bit = ((short) (AccelMagData[4]<<8 | AccelMagData[5])) >> 2;        // Compute 14-bit Z-axis acceleration output value
+
+        
+
+     X_Accel_offset = Xout_Accel_14_bit / 8 * (-1);         // Compute X-axis offset correction value
+
+     Y_Accel_offset = Yout_Accel_14_bit / 8 * (-1);         // Compute Y-axis offset correction value
+
+     Z_Accel_offset = (Zout_Accel_14_bit - SENSITIVITY_2G) / 8 * (-1);          // Compute Z-axis offset correction value
+
+        
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, OFF_X_REG, X_Accel_offset);            
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, OFF_Y_REG, Y_Accel_offset);     
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, OFF_Z_REG, Z_Accel_offset);     
+
+        
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG1, 0x35);          // Active mode again
+
+}
+
+ 
+
+5. A simple software calibration of magnetic hard-iron offset consists of recording the minimum and maximum magnetometer readings while rotating the board horizontally and vertically and then computing the calibration values from their average. The calibration time is defined by the number of samples taken during calibration (local variable “i” in the while loop) and selected ODR. In my example I use 94 samples at 3.125Hz, so the calibration routine takes 30s.
+
+ 
+
+void FXOS8700CQ_Mag_Calibration (void)
+
+{
+
+     short Xout_Mag_16_bit_avg, Yout_Mag_16_bit_avg, Zout_Mag_16_bit_avg;
+
+         short Xout_Mag_16_bit_max, Yout_Mag_16_bit_max, Zout_Mag_16_bit_max;
+
+         short Xout_Mag_16_bit_min, Yout_Mag_16_bit_min, Zout_Mag_16_bit_min;
+
+     char i = 0;
+
+ 
+
+     DataReady = 0;
+
+ 
+
+         while (i < 94)             // This takes ~30s (94 samples * 1/3.125)
+
+     {
+
+              if (DataReady)             // Is a new set of data ready?
+
+        {            
+
+             DataReady = 0;
+
+                                                                                                                                                 
+
+             I2C_ReadMultiRegisters(FXOS8700CQ_I2C_ADDRESS, MOUT_X_MSB_REG, 6, AccelMagData);         // Read data output registers 0x33 - 0x38
+
+                    
+
+             Xout_Mag_16_bit = (short) (AccelMagData[0]<<8 | AccelMagData[1]);        // Compute 16-bit X-axis magnetic output value
+
+             Yout_Mag_16_bit = (short) (AccelMagData[2]<<8 | AccelMagData[3]);        // Compute 16-bit Y-axis magnetic output value
+
+             Zout_Mag_16_bit = (short) (AccelMagData[4]<<8 | AccelMagData[5]);        // Compute 16-bit Z-axis magnetic output value
+
+                   
+
+                       // Assign first sample to maximum and minimum values
+
+                       if (i == 0)
+
+             {
+
+                  Xout_Mag_16_bit_max = Xout_Mag_16_bit;
+
+                  Xout_Mag_16_bit_min = Xout_Mag_16_bit;
+
+                            
+
+                  Yout_Mag_16_bit_max = Yout_Mag_16_bit;
+
+                  Yout_Mag_16_bit_min = Yout_Mag_16_bit;
+
+                            
+
+                  Zout_Mag_16_bit_max = Zout_Mag_16_bit;
+
+                  Zout_Mag_16_bit_min = Zout_Mag_16_bit;
+
+             }
+
+               
+
+                      // Check to see if current sample is the maximum or minimum X-axis value
+
+                      if (Xout_Mag_16_bit > Xout_Mag_16_bit_max)    {Xout_Mag_16_bit_max = Xout_Mag_16_bit;}
+
+                      if (Xout_Mag_16_bit < Xout_Mag_16_bit_min)    {Xout_Mag_16_bit_min = Xout_Mag_16_bit;}
+
+ 
+
+                      // Check to see if current sample is the maximum or minimum Y-axis value
+
+                      if (Yout_Mag_16_bit > Yout_Mag_16_bit_max)    {Yout_Mag_16_bit_max = Yout_Mag_16_bit;}
+
+                      if (Yout_Mag_16_bit < Yout_Mag_16_bit_min)    {Yout_Mag_16_bit_min = Yout_Mag_16_bit;}
+
+               
+
+                      // Check to see if current sample is the maximum or minimum Z-axis value
+
+                      if (Zout_Mag_16_bit > Zout_Mag_16_bit_max)    {Zout_Mag_16_bit_max = Zout_Mag_16_bit;}
+
+                      if (Zout_Mag_16_bit < Zout_Mag_16_bit_min)    {Zout_Mag_16_bit_min = Zout_Mag_16_bit;}
+
+               
+
+             i++;
+
+         }     
+
+     }
+
+ 
+
+     Xout_Mag_16_bit_avg = (Xout_Mag_16_bit_max + Xout_Mag_16_bit_min) / 2;            // X-axis hard-iron offset
+
+     Yout_Mag_16_bit_avg = (Yout_Mag_16_bit_max + Yout_Mag_16_bit_min) / 2;            // Y-axis hard-iron offset
+
+     Zout_Mag_16_bit_avg = (Zout_Mag_16_bit_max + Zout_Mag_16_bit_min) / 2;            // Z-axis hard-iron offset
+
+
+     // Left-shift by one as magnetometer offset registers are 15-bit only, left justified
+
+     Xout_Mag_16_bit_avg <<= 1;       
+
+     Yout_Mag_16_bit_avg <<= 1;
+
+      Zout_Mag_16_bit_avg <<= 1;
+
+ 
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG1, 0x00);          // Standby mode to allow writing to the offset registers
+
+ 
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, MOFF_X_LSB_REG, (char) (Xout_Mag_16_bit_avg & 0xFF));       
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, MOFF_X_MSB_REG, (char) ((Xout_Mag_16_bit_avg >> 8) & 0xFF));      
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, MOFF_Y_LSB_REG, (char) (Yout_Mag_16_bit_avg & 0xFF));
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, MOFF_Y_MSB_REG, (char) ((Yout_Mag_16_bit_avg >> 8) & 0xFF));             
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, MOFF_Z_LSB_REG, (char) (Zout_Mag_16_bit_avg & 0xFF));
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, MOFF_Z_MSB_REG, (char) ((Zout_Mag_16_bit_avg >> 8) & 0xFF));      
+
+ 
+
+     I2C_WriteRegister(FXOS8700CQ_I2C_ADDRESS, CTRL_REG1, 0x35);          // Active mode again      
+
+}
+
+ 
+
+6. In the ISR, only the interrupt flag is cleared and the DataReady variable is set to indicate the arrival of new data.
+
+ 
+
+void PORTD_IRQHandler()
+
+{
+
+     PORTD_PCR4 |= PORT_PCR_ISF_MASK;                // Clear the interrupt flag
+
+     DataReady = 1;      
+
+}
+
+ 
+
+7. The output values from accelerometer registers 0x01 – 0x06 are first converted to signed 14-bit integer values and afterwards to real values in g’s. Similarly, the output values from magnetometer registers 0x33 – 0x38 are first converted to signed 16-bit integer values and afterwards to real values in microtesla (µT).
+
+ 
+
+If the board remains flat, then the compass heading can be simply computed from the arctangent of the ratio of the two horizontal magnetic field components. I have used the atan2 function which returns the result in radians (-π and π), so I multiply it by 180/π to end up with degrees.
+
+ 
+
+If you are interested in more complex algorithms for a tilt-compensated e-compass with soft-iron calibration, please refer to our eCompass software.
+
+ 
+
+if (DataReady)             // Is a new set of data ready?
+
+{            
+
+     DataReady = 0;
+
+                                                                                                               
+
+     I2C_ReadMultiRegisters(FXOS8700CQ_I2C_ADDRESS, OUT_X_MSB_REG, 12, AccelMagData);         // Read data output registers 0x01-0x06 and 0x33 - 0x38
+
+      
+
+         // 14-bit accelerometer data
+
+     Xout_Accel_14_bit = ((short) (AccelMagData[0]<<8 | AccelMagData[1])) >> 2;        // Compute 14-bit X-axis acceleration output value
+
+     Yout_Accel_14_bit = ((short) (AccelMagData[2]<<8 | AccelMagData[3])) >> 2;        // Compute 14-bit Y-axis acceleration output value
+
+     Zout_Accel_14_bit = ((short) (AccelMagData[4]<<8 | AccelMagData[5])) >> 2;        // Compute 14-bit Z-axis acceleration output value
+
+               
+
+         // Accelerometer data converted to g's
+
+     Xout_g = ((float) Xout_Accel_14_bit) / SENSITIVITY_2G;        // Compute X-axis output value in g's
+
+     Yout_g = ((float) Yout_Accel_14_bit) / SENSITIVITY_2G;        // Compute Y-axis output value in g's
+
+     Zout_g = ((float) Zout_Accel_14_bit) / SENSITIVITY_2G;        // Compute Z-axis output value in g's 
+
+               
+
+         // 16-bit magnetometer data             
+
+     Xout_Mag_16_bit = (short) (AccelMagData[6]<<8 | AccelMagData[7]);          // Compute 16-bit X-axis magnetic output value
+
+     Yout_Mag_16_bit = (short) (AccelMagData[8]<<8 | AccelMagData[9]);          // Compute 16-bit Y-axis magnetic output value
+
+     Zout_Mag_16_bit = (short) (AccelMagData[10]<<8 | AccelMagData[11]);        // Compute 16-bit Z-axis magnetic output value
+
+                                          
+
+         // Magnetometer data converted to microteslas
+
+     Xout_uT = (float) (Xout_Mag_16_bit) / SENSITIVITY_MAG;        // Compute X-axis output magnetic value in uT
+
+     Yout_uT = (float) (Yout_Mag_16_bit) / SENSITIVITY_MAG;        // Compute Y-axis output magnetic value in uT
+
+     Zout_uT = (float) (Zout_Mag_16_bit) / SENSITIVITY_MAG;        // Compute Z-axis output magnetic value in uT
+
+               
+
+     Heading = atan2 (Yout_uT, Xout_uT) * 180 / PI;         // Compute Yaw angle
+
+}  
+
+
+8. The calculated values can be watched in the "Variables" window on the top right of the Debug perspective or in the FreeMASTER application. To open and run the FreeMASTER project, install the FreeMASTER 1.4 application and FreeMASTER Communication Driver.
+
+ 
+
+CW Variables.JPG.jpg
+
+ 
+
+FreeMASTER Variables.JPG.jpg
+
+ 
+
+Attached you can find the complete source code written in the CW for MCU's v10.5 including the FreeMASTER project.
+
+ 
+
+If there are any questions regarding this simple application, please feel free to ask below. Your feedback or suggestions are also welcome.
